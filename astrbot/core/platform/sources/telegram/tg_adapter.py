@@ -8,6 +8,7 @@ from telegram import BotCommand, Update
 from telegram.constants import ChatType
 from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, filters
 from telegram.ext import MessageHandler as TelegramMessageHandler
+from telegram.ext import BusinessConnectionHandler, BusinessMessagesDeletedHandler
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -44,6 +45,9 @@ class TelegramPlatformAdapter(Platform):
         self.settings = platform_settings
         self.client_self_id = uuid.uuid4().hex[:8]
 
+        # Business connections storage
+        self.business_connections = {}
+
         base_url = self.config.get(
             "telegram_api_base_url", "https://api.telegram.org/bot"
         )
@@ -78,6 +82,18 @@ class TelegramPlatformAdapter(Platform):
             callback=self.message_handler,
         )
         self.application.add_handler(message_handler)
+
+        # Add BusinessConnectionHandler for handling business connection events
+        business_connection_handler = BusinessConnectionHandler(
+            callback=self.business_connection_handler,
+        )
+        self.application.add_handler(business_connection_handler)
+        
+        # Add BusinessMessagesDeletedHandler for handling business message deletion events
+        business_messages_deleted_handler = BusinessMessagesDeletedHandler(
+            callback=self.business_messages_deleted_handler,
+        )
+        self.application.add_handler(business_messages_deleted_handler)
         self.client = self.application.bot
         logger.debug(f"Telegram base url: {self.client.base_url}")
 
@@ -89,7 +105,7 @@ class TelegramPlatformAdapter(Platform):
     ):
         from_username = session.session_id
         await TelegramPlatformEvent.send_with_client(
-            self.client, message_chain, from_username
+            self.client, message_chain, from_username, self.business_connections
         )
         await super().send_by_session(session, message_chain)
 
@@ -200,10 +216,37 @@ class TelegramPlatformAdapter(Platform):
         )
 
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        logger.debug(f"Telegram message: {update.message}")
-        abm = await self.convert_message(update, context)
-        if abm:
-            await self.handle_msg(abm)
+        # Handle regular messages, business messages, and edited business messages
+        message = update.message or update.business_message or update.edited_business_message
+        logger.debug(f"Telegram message: {message}")
+
+        if message:
+            abm = await self.convert_message(update, context)
+            if abm:
+                await self.handle_msg(abm)
+
+    async def business_connection_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle business connection updates"""
+        logger.debug(f"Telegram business connection: {update.business_connection}")
+        # Store business connection information for write permission checks
+        connection = update.business_connection
+        if connection:
+            self.business_connections[connection.id] = {
+                'user_id': connection.user.id,
+                'user_chat_id': connection.user_chat_id,
+                'is_enabled': connection.is_enabled,
+                'can_reply': connection.can_reply,
+                'date': connection.date
+            }
+            logger.info(f"Business connection {'enabled' if connection.is_enabled else 'disabled'} for user {connection.user.id}, can_reply: {connection.can_reply}")
+
+    async def business_messages_deleted_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle business messages deleted updates"""
+        logger.debug(f"Telegram business messages deleted: {update.business_messages_deleted}")
+        # Handle business message deletion events
+        deleted_messages = update.business_messages_deleted
+        if deleted_messages:
+            logger.info(f"Business messages deleted in chat {deleted_messages.chat.id}: {len(deleted_messages.message_ids)} messages")
 
     async def convert_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, get_reply=True
@@ -214,37 +257,51 @@ class TelegramPlatformAdapter(Platform):
         @param context: Telegram 的 Context 对象。
         @param get_reply: 是否获取回复消息。这个参数是为了防止多个回复嵌套。
         """
+        # Handle regular messages, business messages, and edited business messages
+        telegram_message = update.message or update.business_message or update.edited_business_message
+        if not telegram_message:
+            return None
+            
         message = AstrBotMessage()
-        message.session_id = str(update.message.chat.id)
+        message.session_id = str(telegram_message.chat.id)
         # 获得是群聊还是私聊
-        if update.message.chat.type == ChatType.PRIVATE:
+        if telegram_message.chat.type == ChatType.PRIVATE:
             message.type = MessageType.FRIEND_MESSAGE
         else:
             message.type = MessageType.GROUP_MESSAGE
-            message.group_id = str(update.message.chat.id)
-            if update.message.message_thread_id:
+            message.group_id = str(telegram_message.chat.id)
+            if telegram_message.message_thread_id:
                 # Topic Group
-                message.group_id += "#" + str(update.message.message_thread_id)
+                message.group_id += "#" + str(telegram_message.message_thread_id)
                 message.session_id = message.group_id
 
-        message.message_id = str(update.message.message_id)
+        message.message_id = str(telegram_message.message_id)
         message.sender = MessageMember(
-            str(update.message.from_user.id), update.message.from_user.username
+            str(telegram_message.from_user.id), telegram_message.from_user.username
         )
         message.self_id = str(context.bot.username)
         message.raw_message = update
         message.message_str = ""
         message.message = []
+        
+        # Add business connection context if this is a business message or edited business message
+        business_message = update.business_message or update.edited_business_message
+        if business_message:
+            business_connection_id = business_message.business_connection_id
+            if business_connection_id:
+                message.session_id += f"#business#{business_connection_id}"
+                # Store business connection id in message for later use
+                message.business_connection_id = business_connection_id
 
-        if update.message.reply_to_message and not (
-            update.message.is_topic_message
-            and update.message.message_thread_id
-            == update.message.reply_to_message.message_id
+        if telegram_message.reply_to_message and not (
+            telegram_message.is_topic_message
+            and telegram_message.message_thread_id
+            == telegram_message.reply_to_message.message_id
         ):
             # 获取回复消息
             reply_update = Update(
                 update_id=1,
-                message=update.message.reply_to_message,
+                message=telegram_message.reply_to_message,
             )
             reply_abm = await self.convert_message(reply_update, context, False)
 
@@ -261,9 +318,9 @@ class TelegramPlatformAdapter(Platform):
                 )
             )
 
-        if update.message.text:
+        if telegram_message.text:
             # 处理文本消息
-            plain_text = update.message.text
+            plain_text = telegram_message.text
 
             # 群聊场景命令特殊处理
             if plain_text.startswith("/"):
@@ -275,8 +332,8 @@ class TelegramPlatformAdapter(Platform):
                             f" {command_parts[1]}" if len(command_parts) > 1 else ""
                         )
 
-            if update.message.entities:
-                for entity in update.message.entities:
+            if telegram_message.entities:
+                for entity in telegram_message.entities:
                     if entity.type == "mention":
                         name = plain_text[
                             entity.offset + 1 : entity.offset + entity.length
@@ -297,44 +354,44 @@ class TelegramPlatformAdapter(Platform):
                 await self.start(update, context)
                 return
 
-        elif update.message.voice:
-            file = await update.message.voice.get_file()
+        elif telegram_message.voice:
+            file = await telegram_message.voice.get_file()
             message.message = [
                 Comp.Record(file=file.file_path, url=file.file_path),
             ]
 
-        elif update.message.photo:
-            photo = update.message.photo[-1]  # get the largest photo
+        elif telegram_message.photo:
+            photo = telegram_message.photo[-1]  # get the largest photo
             file = await photo.get_file()
             message.message.append(Comp.Image(file=file.file_path, url=file.file_path))
-            if update.message.caption:
-                message.message_str = update.message.caption
+            if telegram_message.caption:
+                message.message_str = telegram_message.caption
                 message.message.append(Comp.Plain(message.message_str))
-            if update.message.caption_entities:
-                for entity in update.message.caption_entities:
+            if telegram_message.caption_entities:
+                for entity in telegram_message.caption_entities:
                     if entity.type == "mention":
                         name = message.message_str[
                             entity.offset + 1 : entity.offset + entity.length
                         ]
                         message.message.append(Comp.At(qq=name, name=name))
 
-        elif update.message.sticker:
+        elif telegram_message.sticker:
             # 将sticker当作图片处理
-            file = await update.message.sticker.get_file()
+            file = await telegram_message.sticker.get_file()
             message.message.append(Comp.Image(file=file.file_path, url=file.file_path))
-            if update.message.sticker.emoji:
-                sticker_text = f"Sticker: {update.message.sticker.emoji}"
+            if telegram_message.sticker.emoji:
+                sticker_text = f"Sticker: {telegram_message.sticker.emoji}"
                 message.message_str = sticker_text
                 message.message.append(Comp.Plain(sticker_text))
 
-        elif update.message.document:
-            file = await update.message.document.get_file()
+        elif telegram_message.document:
+            file = await telegram_message.document.get_file()
             message.message = [
-                Comp.File(file=file.file_path, name=update.message.document.file_name),
+                Comp.File(file=file.file_path, name=telegram_message.document.file_name),
             ]
 
-        elif update.message.video:
-            file = await update.message.video.get_file()
+        elif telegram_message.video:
+            file = await telegram_message.video.get_file()
             message.message = [
                 Comp.Video(file=file.file_path, path=file.file_path),
             ]
@@ -348,6 +405,7 @@ class TelegramPlatformAdapter(Platform):
             platform_meta=self.meta(),
             session_id=message.session_id,
             client=self.client,
+            business_connections=self.business_connections,
         )
         self.commit_event(message_event)
 

@@ -36,9 +36,11 @@ class TelegramPlatformEvent(AstrMessageEvent):
         platform_meta: PlatformMetadata,
         session_id: str,
         client: ExtBot,
+        business_connections: dict = None,
     ):
         super().__init__(message_str, message_obj, platform_meta, session_id)
         self.client = client
+        self.business_connections = business_connections or {}
 
     def _split_message(self, text: str) -> list[str]:
         if len(text) <= self.MAX_MESSAGE_LENGTH:
@@ -64,9 +66,13 @@ class TelegramPlatformEvent(AstrMessageEvent):
 
         return chunks
 
+    @staticmethod
     async def send_with_client(
-        self, client: ExtBot, message: MessageChain, user_name: str
+        client: ExtBot, message: MessageChain, user_name: str, business_connections: dict = None
     ):
+        if business_connections is None:
+            business_connections = {}
+            
         image_path = None
 
         has_reply = False
@@ -81,9 +87,29 @@ class TelegramPlatformEvent(AstrMessageEvent):
 
         at_flag = False
         message_thread_id = None
-        if "#" in user_name:
+        business_connection_id = None
+        
+        # Parse session_id to extract business connection info
+        if "#business#" in user_name:
+            parts = user_name.split("#business#")
+            user_name = parts[0]
+            business_connection_id = parts[1]
+            
+            # Check business connection permissions
+            if business_connection_id in business_connections:
+                connection_info = business_connections[business_connection_id]
+                if not connection_info.get('can_reply', False):
+                    logger.warning(f"Bot cannot reply in business connection {business_connection_id}")
+                    return
+                if not connection_info.get('is_enabled', False):
+                    logger.warning(f"Business connection {business_connection_id} is disabled")
+                    return
+            else:
+                logger.warning(f"Business connection {business_connection_id} not found in stored connections, but still trying to send with business_connection_id")
+        elif "#" in user_name:
             # it's a supergroup chat with message_thread_id
             user_name, message_thread_id = user_name.split("#")
+            
         for i in message.chain:
             payload = {
                 "chat_id": user_name,
@@ -92,12 +118,14 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 payload["reply_to_message_id"] = reply_message_id
             if message_thread_id:
                 payload["message_thread_id"] = message_thread_id
+            if business_connection_id:
+                payload["business_connection_id"] = business_connection_id
 
             if isinstance(i, Plain):
                 if at_user_id and not at_flag:
                     i.text = f"@{at_user_id} {i.text}"
                     at_flag = True
-                chunks = self._split_message(i.text)
+                chunks = TelegramPlatformEvent._split_message_static(i.text)
                 for chunk in chunks:
                     try:
                         md_text = telegramify_markdown.markdownify(
@@ -126,29 +154,79 @@ class TelegramPlatformEvent(AstrMessageEvent):
                 path = await i.convert_to_file_path()
                 await client.send_voice(voice=path, **payload)
 
+    @staticmethod
+    def _split_message_static(text: str) -> list[str]:
+        """Static version of _split_message for use in static method"""
+        MAX_MESSAGE_LENGTH = 4096
+        SPLIT_PATTERNS = {
+            "paragraph": re.compile(r"\n\n"),
+            "line": re.compile(r"\n"),
+            "sentence": re.compile(r"[.!?。！？]"),
+            "word": re.compile(r"\s"),
+        }
+        
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            return [text]
+
+        chunks = []
+        while text:
+            if len(text) <= MAX_MESSAGE_LENGTH:
+                chunks.append(text)
+                break
+
+            split_point = MAX_MESSAGE_LENGTH
+            segment = text[:MAX_MESSAGE_LENGTH]
+
+            for _, pattern in SPLIT_PATTERNS.items():
+                if matches := list(pattern.finditer(segment)):
+                    last_match = matches[-1]
+                    split_point = last_match.end()
+                    break
+
+            chunks.append(text[:split_point])
+            text = text[split_point:].lstrip()
+
+        return chunks
+
     async def send(self, message: MessageChain):
-        if self.get_message_type() == MessageType.GROUP_MESSAGE:
-            await self.send_with_client(self.client, message, self.message_obj.group_id)
-        else:
-            await self.send_with_client(self.client, message, self.get_sender_id())
+        await self.send_with_client(self.client, message, self.get_session_id(), self.business_connections)
         await super().send(message)
 
     async def send_streaming(self, generator, use_fallback: bool = False):
         message_thread_id = None
+        business_connection_id = None
 
-        if self.get_message_type() == MessageType.GROUP_MESSAGE:
-            user_name = self.message_obj.group_id
-        else:
-            user_name = self.get_sender_id()
-
-        if "#" in user_name:
+        # Parse session_id to extract business connection info
+        session_id = self.get_session_id()
+        user_name = session_id  # Default to session_id
+        
+        if "#business#" in session_id:
+            parts = session_id.split("#business#")
+            user_name = parts[0]
+            business_connection_id = parts[1]
+            
+            # Check business connection permissions
+            if business_connection_id in self.business_connections:
+                connection_info = self.business_connections[business_connection_id]
+                if not connection_info.get('can_reply', False):
+                    logger.warning(f"Bot cannot reply in business connection {business_connection_id}")
+                    return await super().send_streaming(generator, use_fallback)
+                if not connection_info.get('is_enabled', False):
+                    logger.warning(f"Business connection {business_connection_id} is disabled")
+                    return await super().send_streaming(generator, use_fallback)
+            else:
+                logger.warning(f"Business connection {business_connection_id} not found in stored connections, but still trying to send with business_connection_id")
+        elif "#" in session_id and self.get_message_type() == MessageType.GROUP_MESSAGE:
             # it's a supergroup chat with message_thread_id
-            user_name, message_thread_id = user_name.split("#")
+            user_name, message_thread_id = session_id.split("#")
+            
         payload = {
             "chat_id": user_name,
         }
         if message_thread_id:
-            payload["reply_to_message_id"] = message_thread_id
+            payload["message_thread_id"] = message_thread_id
+        if business_connection_id:
+            payload["business_connection_id"] = business_connection_id
 
         delta = ""
         current_content = ""
