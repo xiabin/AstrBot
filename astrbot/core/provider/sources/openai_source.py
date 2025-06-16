@@ -314,6 +314,20 @@ class ProviderOpenAIOfficial(Provider):
                 context_query,
                 func_tool,
             )
+        elif "Provided image is not valid" in str(e) or "INVALID_ARGUMENT" in str(e):
+            # 图片格式无效错误，尝试删除所有图片
+            logger.warning(f"图片格式无效：{e}，尝试删除所有图片后重试。")
+            new_contexts = await self._remove_image_from_context(context_query)
+            payloads["messages"] = new_contexts
+            context_query = new_contexts
+            return (
+                False,
+                chosen_key,
+                available_api_keys,
+                payloads,
+                context_query,
+                func_tool,
+            )
         elif (
             "Function calling is not enabled" in str(e)
             or ("tool" in str(e).lower() and "support" in str(e).lower())
@@ -546,7 +560,77 @@ class ProviderOpenAIOfficial(Provider):
         """
         if image_url.startswith("base64://"):
             return image_url.replace("base64://", "data:image/jpeg;base64,")
-        with open(image_url, "rb") as f:
-            image_bs64 = base64.b64encode(f.read()).decode("utf-8")
-            return "data:image/jpeg;base64," + image_bs64
-        return ""
+        
+        try:
+            with open(image_url, "rb") as f:
+                image_data = f.read()
+            
+            file_size = len(image_data)
+            
+            # 检查文件是否为空
+            if file_size == 0:
+                logger.warning(f"图片文件为空：{image_url}")
+                return ""
+            
+            # 检查文件大小是否过大 (10MB限制)
+            if file_size > 10 * 1024 * 1024:
+                logger.warning(f"图片文件过大 ({file_size} bytes)，可能会导致API错误：{image_url}")
+            
+            # 检查文件实际类型（基于文件头部魔术字节）
+            from mimetypes import guess_type
+            mime_type, _ = guess_type(image_url)
+            
+            # 如果无法通过扩展名确定类型，使用文件头部检测
+            if not mime_type or not mime_type.startswith('image/'):
+                # 检查文件头部以识别常见图片格式
+                if image_data.startswith(b'\xff\xd8\xff'):
+                    mime_type = "image/jpeg"
+                elif image_data.startswith(b'\x89PNG\r\n\x1a\n'):
+                    mime_type = "image/png"
+                elif image_data.startswith(b'GIF8'):
+                    mime_type = "image/gif"
+                elif image_data.startswith(b'RIFF') and b'WEBP' in image_data[:12]:
+                    mime_type = "image/webp"
+                elif image_data.startswith(b'\x1f\x8b'):
+                    logger.warning(f"检测到 gzip 压缩文件，不是图片格式，将被忽略：{image_url}")
+                    return ""
+                else:
+                    logger.warning(f"无法识别的文件格式，将被忽略：{image_url}")
+                    return ""
+            
+            # 再次验证是否为有效的图片类型
+            valid_image_types = [
+                'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 
+                'image/webp', 'image/bmp', 'image/tiff'
+            ]
+            
+            if mime_type not in valid_image_types:
+                logger.warning(f"文件不是有效的图片格式 ({mime_type})，将被忽略：{image_url}")
+                return ""
+            
+            # 使用 PIL 验证图片有效性
+            try:
+                from PIL import Image
+                import io
+                with Image.open(io.BytesIO(image_data)) as img:
+                    img.verify()
+            except Exception as img_e:
+                logger.warning(f"PIL 图片验证失败：{image_url}, 错误：{img_e}")
+                return ""
+            
+            image_bs64 = base64.b64encode(image_data).decode("utf-8")
+            result = f"data:{mime_type};base64,{image_bs64}"
+            return result
+            
+        except FileNotFoundError:
+            logger.warning(f"图片文件不存在：{image_url}")
+            return ""
+        except PermissionError:
+            logger.warning(f"没有权限读取图片文件：{image_url}")
+            return ""
+        except OSError as e:
+            logger.error(f"读取图片文件时发生系统错误：{image_url}, 错误：{e}")
+            return ""
+        except Exception as e:
+            logger.error(f"图片编码失败：{image_url}, 错误类型：{type(e).__name__}, 错误信息：{e}")
+            return ""

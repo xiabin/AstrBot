@@ -376,7 +376,7 @@ class TelegramPlatformAdapter(Platform):
                         message.message.append(Comp.At(qq=name, name=name))
 
         elif telegram_message.sticker:
-            # 将sticker当作图片处理
+            # 将sticker当作图片处理（在encode_image_bs64中会进行文件类型检测和过滤）
             file = await telegram_message.sticker.get_file()
             message.message.append(Comp.Image(file=file.file_path, url=file.file_path))
             if telegram_message.sticker.emoji:
